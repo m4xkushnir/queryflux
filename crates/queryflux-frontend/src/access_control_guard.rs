@@ -27,6 +27,21 @@ use queryflux_sql::{
 
 use queryflux_auth::AuthContext;
 
+/// Client header carrying the text of Trino prepared statements, as `name=sql` pairs.
+const TRINO_PREPARED_STATEMENT_HEADER: &str = "x-trino-prepared-statement";
+
+/// Drop session data that would let the engine run SQL the guard never saw. A Trino client
+/// sends the text of its prepared statements in `X-Trino-Prepared-Statement`, and Trino
+/// resolves `EXECUTE q`, `DESCRIBE INPUT q`, `DESCRIBE OUTPUT q` and the like against it,
+/// while the guard only sees the statement body. Without the header those statements fail on
+/// the engine instead of running unchecked SQL. Call this whenever
+/// [`OpaAccessGuard::applies_to_group`] holds, before the session reaches an adapter.
+pub fn drop_unchecked_session_sql(session: &mut SessionContext) {
+    session
+        .extra
+        .retain(|k, _| !k.eq_ignore_ascii_case(TRINO_PREPARED_STATEMENT_HEADER));
+}
+
 /// Outcome of the pre-translation access-control stage.
 pub enum AccessStageOutcome {
     /// Query may proceed unchanged. `action` is recorded for audit.
@@ -138,6 +153,15 @@ impl OpaAccessGuard {
         self.config.connection_name_for_group(group)
     }
 
+    /// Whether this guard judges queries for `group`: enabled, a connection resolves, and
+    /// that connection evaluates at least one operation.
+    pub fn applies_to_group(&self, group: &str) -> bool {
+        self.enabled_for_group(group)
+            && self
+                .connection_for_group(group)
+                .is_some_and(|c| evaluates_anything(&c.controller))
+    }
+
     fn connection_for_group(&self, group: &str) -> Option<&ConnectionRuntime> {
         self.connection_name_for_group(group)
             .and_then(|name| self.connections.get(name))
@@ -232,15 +256,18 @@ impl Guard for OpaAccessGuard {
             }
         }
 
-        // `EXECUTE <name>` runs a statement prepared earlier (Trino clients send its text in
-        // the `X-Trino-Prepared-Statement` header, which the Trino adapter forwards) and
-        // `EXECUTE IMMEDIATE '<sql>'` runs a string. Neither SQL is in front of us, so
-        // neither can be judged. `PREPARE` goes with them: its only use is a later EXECUTE.
-        if runs_sql_it_does_not_show(ctx.sql) && evaluates_anything(&conn.controller) {
-            return GuardResult::deny(
-                "access control: EXECUTE and PREPARE statements are not supported",
-                "ACCESS_UNSUPPORTED_STATEMENT",
-            );
+        // Statements that run SQL other than their own text: `EXECUTE` (a prepared statement
+        // or `EXECUTE IMMEDIATE '<sql>'`), `PREPARE`, PostgreSQL `DO`, procedural blocks, and
+        // `CALL`. The tables that SQL touches are never in front of us, so none of them can
+        // be judged. `CALL` is left to the policy when `procedure.call` is evaluated, since
+        // the policy then decides which procedures may run.
+        if let Some(kind) = runs_sql_it_does_not_show(ctx.sql, &conn.controller) {
+            if evaluates_anything(&conn.controller) {
+                return GuardResult::deny(
+                    format!("access control: {kind} statements are not supported"),
+                    "ACCESS_UNSUPPORTED_STATEMENT",
+                );
+            }
         }
 
         let stmts = match ctx.sql_parse {
@@ -644,10 +671,44 @@ fn classify_operation(stmts: Option<&[Expression]>, sql: &str) -> Operation {
     }
 }
 
-/// `EXECUTE …` or `PREPARE …`: statements whose SQL is not their own text.
-fn runs_sql_it_does_not_show(sql: &str) -> bool {
-    let head = word_at(queryflux_sql::classify::strip_leading_sql_comments(sql));
-    head.eq_ignore_ascii_case("execute") || head.eq_ignore_ascii_case("prepare")
+/// Words that may follow `BEGIN` when it starts a transaction rather than a procedural block
+/// (PostgreSQL, MySQL, Snowflake, SQL Server, SQLite forms).
+const BEGIN_TRANSACTION_WORDS: &[&str] = &[
+    "transaction",
+    "work",
+    "tran",
+    "isolation",
+    "read",
+    "deferrable",
+    "not",
+    "name",
+    "deferred",
+    "immediate",
+    "exclusive",
+    "distributed",
+];
+
+/// The kind of statement, if `sql` runs SQL that is not its own text: `EXECUTE …`,
+/// `PREPARE …`, `DO …`, a procedural block (`BEGIN … END`, `DECLARE …`), or `CALL …` when
+/// the connection does not evaluate `procedure.call`.
+fn runs_sql_it_does_not_show(sql: &str, controller: &AccessController) -> Option<&'static str> {
+    let s = queryflux_sql::classify::strip_leading_sql_comments(sql);
+    let head = word_at(s).to_ascii_lowercase();
+    match head.as_str() {
+        "execute" => Some("EXECUTE"),
+        "prepare" => Some("PREPARE"),
+        "do" => Some("DO"),
+        "declare" => Some("procedural block"),
+        "begin" => {
+            let rest = queryflux_sql::classify::strip_leading_sql_comments(&s[head.len()..]);
+            let next = word_at(rest).to_ascii_lowercase();
+            let rest_is_empty = rest.trim_start_matches(';').trim().is_empty();
+            (!rest_is_empty && !BEGIN_TRANSACTION_WORDS.contains(&next.as_str()))
+                .then_some("procedural block")
+        }
+        "call" if !controller.evaluates(&Operation("procedure.call".to_string())) => Some("CALL"),
+        _ => None,
+    }
 }
 
 /// Whether the connection evaluates any operation at all.
@@ -1521,12 +1582,8 @@ mod tests {
         }
     }
 
-    /// A Trino client can send the statement text in the `X-Trino-Prepared-Statement`
-    /// header and only `EXECUTE <name>` in the body; the Trino adapter forwards every
-    /// `X-Trino-*` header, so Trino runs the header's SQL. The guard must not allow an
-    /// `EXECUTE` (or a `PREPARE`) it can't see the tables of.
-    #[tokio::test]
-    async fn execute_of_a_prepared_statement_is_not_allowed_unchecked() {
+    /// An OPA stub that denies every table it is asked about.
+    async fn start_deny_all_stub() -> String {
         async fn deny_all(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
             let resources: Vec<serde_json::Value> = body["input"]["action"]["resources"]
                 .as_array()
@@ -1542,53 +1599,128 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.ok();
         });
+        url
+    }
+
+    fn guard_for(url: &str, operations: Option<&[&str]>) -> Arc<OpaAccessGuard> {
+        let mut conn = opa_connection(url);
+        if let Some(ops) = operations {
+            conn.operations = ops.iter().map(|o| o.to_string()).collect();
+        }
         let cfg = AccessControlConfig {
             enabled: true,
             default_connection: Some("default".to_string()),
-            connections: HashMap::from([("default".to_string(), opa_connection(&url))]),
+            connections: HashMap::from([("default".to_string(), conn)]),
             groups: HashMap::new(),
         };
-        let guard = OpaAccessGuard::try_from_config(&cfg).expect("build guard");
+        OpaAccessGuard::try_from_config(&cfg).expect("build guard")
+    }
+
+    async fn check_trino(guard: &OpaAccessGuard, sql: &str) -> GuardResult {
         let (dialect, engine_type) = (SqlDialect::Trino, EngineType::Trino);
         let group = ClusterGroupName("g".to_string());
         let (attributes, query_tags, session_extra) =
             (BTreeMap::new(), QueryTags::new(), HashMap::new());
-        let check = |sql: &'static str| {
-            let (guard, dialect, engine_type, group) = (&guard, &dialect, &engine_type, &group);
-            let (attributes, query_tags, session_extra) =
-                (&attributes, &query_tags, &session_extra);
-            async move {
-                let parse = SqlParseCache::new(sql.to_string(), dialect.clone());
-                let ctx = GuardContext {
-                    sql,
-                    original_sql: None,
-                    dialect,
-                    engine_type,
-                    cluster_group: group,
-                    user: Some("bob"),
-                    groups: &[],
-                    roles: &[],
-                    attributes,
-                    agent_context: None,
-                    query_tags,
-                    session_extra,
-                    schema: None,
-                    sql_parse: Some(&parse),
-                };
-                guard.check(&ctx).await
-            }
+        let parse = SqlParseCache::new(sql.to_string(), dialect.clone());
+        let ctx = GuardContext {
+            sql,
+            original_sql: None,
+            dialect: &dialect,
+            engine_type: &engine_type,
+            cluster_group: &group,
+            user: Some("bob"),
+            groups: &[],
+            roles: &[],
+            attributes: &attributes,
+            agent_context: None,
+            query_tags: &query_tags,
+            session_extra: &session_extra,
+            schema: None,
+            sql_parse: Some(&parse),
         };
+        guard.check(&ctx).await
+    }
 
-        // Control: the table itself is denied.
-        assert!(check("SELECT * FROM salaries").await.is_deny());
-        for sql in [
-            "EXECUTE q",
-            "EXECUTE q USING 1",
-            "PREPARE q FROM SELECT * FROM salaries",
-            "EXECUTE IMMEDIATE 'SELECT * FROM salaries'",
-        ] {
-            assert!(check(sql).await.is_deny(), "{sql} must not be allowed");
+    fn deny_code(result: &GuardResult) -> Option<&str> {
+        match result {
+            GuardResult::Deny { code, .. } => code.as_deref(),
+            _ => None,
         }
     }
 
+    /// Statements that run SQL other than their own text (a prepared statement, a string,
+    /// a `DO` body, a procedural block, a procedure) can't have their tables checked, so
+    /// the guard refuses them by kind rather than letting them through with no tables.
+    #[tokio::test]
+    async fn statements_that_run_unseen_sql_are_refused() {
+        let url = start_deny_all_stub().await;
+        let guard = guard_for(&url, None);
+
+        // Control: the table itself is denied by the policy.
+        assert_eq!(
+            deny_code(&check_trino(&guard, "SELECT * FROM salaries").await),
+            Some("ACCESS_DENIED")
+        );
+        for sql in [
+            "EXECUTE q",
+            "execute q USING 1",
+            "/* x */ EXECUTE q",
+            "-- run it\nEXECUTE q",
+            "PREPARE q FROM SELECT * FROM salaries",
+            "EXECUTE IMMEDIATE 'SELECT * FROM salaries'",
+            "DO $$ BEGIN EXECUTE 'INSERT INTO x SELECT * FROM payroll'; END $$",
+            "BEGIN EXECUTE IMMEDIATE 'SELECT * FROM payroll'; END",
+            "DECLARE c CURSOR FOR SELECT 1; BEGIN OPEN c; END",
+            "CALL build_report()",
+        ] {
+            assert_eq!(
+                deny_code(&check_trino(&guard, sql).await),
+                Some("ACCESS_UNSUPPORTED_STATEMENT"),
+                "{sql} must be refused as unsupported"
+            );
+        }
+        // Transaction control and table-free statements are unaffected.
+        for sql in [
+            "BEGIN",
+            "BEGIN;",
+            "BEGIN TRANSACTION",
+            "begin work",
+            "SELECT 1",
+        ] {
+            assert!(
+                matches!(check_trino(&guard, sql).await, GuardResult::Allow { .. }),
+                "{sql} must be allowed"
+            );
+        }
+    }
+
+    /// With `procedure.call` evaluated, the policy decides which procedures may run, so
+    /// `CALL` is judged on its procedure instead of refused outright.
+    #[tokio::test]
+    async fn call_goes_to_the_policy_when_procedure_call_is_evaluated() {
+        let url = start_deny_all_stub().await;
+        let guard = guard_for(&url, Some(&["table.select", "procedure.call"]));
+        let result = check_trino(&guard, "CALL build_report()").await;
+        assert_ne!(deny_code(&result), Some("ACCESS_UNSUPPORTED_STATEMENT"));
+    }
+
+    #[test]
+    fn prepared_statement_text_is_dropped_from_the_session() {
+        let mut session = SessionContext::default();
+        session.extra.insert(
+            "x-trino-prepared-statement".to_string(),
+            "q=SELECT+*+FROM+payroll".to_string(),
+        );
+        session
+            .extra
+            .insert("X-Trino-Prepared-Statement".to_string(), "r=x".to_string());
+        session
+            .extra
+            .insert("x-trino-catalog".to_string(), "hive".to_string());
+        drop_unchecked_session_sql(&mut session);
+        assert_eq!(
+            session.extra.keys().collect::<Vec<_>>(),
+            vec!["x-trino-catalog"]
+        );
+    }
 }

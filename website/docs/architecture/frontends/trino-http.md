@@ -94,7 +94,7 @@ curl -X POST http://localhost:8080/v1/statement \
 
 | Feature | Status |
 |---------|--------|
-| Prepared statements | Forwarded, not inspected. Trino clients send `EXECUTE <name>` with the statement text in the `X-Trino-Prepared-Statement` header (or `EXECUTE IMMEDIATE '<sql>'`), and QueryFlux passes `X-Trino-*` headers through. With access control enabled, `EXECUTE` and `PREPARE` are denied, since the SQL they run is not in the statement QueryFlux checks. |
+| Prepared statements | Forwarded when access control does not apply to the cluster group. Trino clients send `EXECUTE <name>` with the statement text in the `X-Trino-Prepared-Statement` header. When access control applies (the group resolves to a connection that evaluates at least one operation), QueryFlux drops that header, so statements that refer to a prepared statement fail on Trino, and denies `EXECUTE`, `PREPARE`, procedural blocks and `CALL` (unless `procedure.call` is evaluated), since the SQL they run is not in the statement QueryFlux checks. |
 | TLS termination | Not handled by QueryFlux. Use an external TLS terminator in front of the Trino HTTP listener. |
 
 ## Related
